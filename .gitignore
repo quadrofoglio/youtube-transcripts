@@ -1,0 +1,9 @@
+.env
+state.csv
+run.log
+transcripts/
+__pycache__/
+*.pyc
+*.mp3
+*.wav
+*.m4a
