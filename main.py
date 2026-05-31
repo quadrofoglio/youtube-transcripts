@@ -51,35 +51,54 @@ def _output_path(output_dir: str, video: dict) -> str:
     return os.path.join(output_dir, video["playlist"], filename)
 
 
+def _collect_inbox_files(inbox_dir: str, processed_ids: set) -> list[tuple[str, str, str]]:
+    """Return list of (audio_path, stem, show_name) for all unprocessed audio files.
+
+    Files in the root inbox_dir use 'Local Audio' as the show name.
+    Files in a subfolder use the subfolder name as the show name.
+    """
+    items = []
+    for entry in os.scandir(inbox_dir):
+        if entry.is_file() and os.path.splitext(entry.name)[1].lower() in AUDIO_EXTENSIONS:
+            stem = os.path.splitext(entry.name)[0]
+            if stem not in processed_ids:
+                items.append((entry.path, stem, "Local Audio"))
+        elif entry.is_dir():
+            show_name = entry.name
+            for sub in os.scandir(entry.path):
+                if sub.is_file() and os.path.splitext(sub.name)[1].lower() in AUDIO_EXTENSIONS:
+                    stem = os.path.splitext(sub.name)[0]
+                    unique_id = f"{show_name}/{stem}"
+                    if unique_id not in processed_ids:
+                        items.append((sub.path, unique_id, show_name))
+    return items
+
+
 def _process_audio_inbox(inbox_dir: str, output_dir: str, whisper_model: str, processed_ids: set, dry_run: bool) -> tuple[int, int]:
     if not os.path.isdir(inbox_dir):
         return 0, 0
 
-    files = [
-        f for f in os.listdir(inbox_dir)
-        if os.path.splitext(f)[1].lower() in AUDIO_EXTENSIONS
-        and os.path.splitext(f)[0] not in processed_ids
-    ]
+    items = _collect_inbox_files(inbox_dir, processed_ids)
 
-    if not files:
+    if not items:
         return 0, 0
 
-    log.info("Audio inbox: %d file(s) to transcribe", len(files))
+    log.info("Audio inbox: %d file(s) to transcribe", len(items))
 
     if dry_run:
-        for f in files:
-            log.info("  [DRY RUN] Would transcribe: %s", f)
+        for _, stem, show in items:
+            log.info("  [DRY RUN] Would transcribe: %s / %s", show, stem)
         return 0, 0
 
     success, failed = 0, 0
-    for filename in files:
-        audio_path = os.path.join(inbox_dir, filename)
+    for audio_path, unique_id, show_name in items:
+        filename = os.path.basename(audio_path)
         stem = os.path.splitext(filename)[0]
-        out_path = os.path.join(output_dir, "Local Audio", f"{stem}.txt")
-        log.info("Transcribing local file: %s", filename)
+        out_path = os.path.join(output_dir, show_name, f"{stem}.txt")
+        log.info("Transcribing: %s / %s", show_name, filename)
         try:
             transcribe(audio_path, whisper_model, out_path)
-            mark_processed(stem, stem, "Local Audio")
+            mark_processed(unique_id, stem, show_name)
             os.remove(audio_path)
             log.info("  Saved: %s", out_path)
             success += 1
