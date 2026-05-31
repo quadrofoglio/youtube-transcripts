@@ -25,9 +25,23 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-def _parse_env_list(key: str) -> list[str]:
+def _parse_env_entries(key: str) -> list[tuple[str, str]]:
+    """Parse 'Name::URL|Name::URL' into list of (name, url) tuples."""
     raw = os.getenv(key, "").strip()
-    return [u.strip() for u in raw.split("|") if u.strip()]
+    entries = []
+    for part in raw.split("|"):
+        part = part.strip()
+        if not part:
+            continue
+        if "::" in part:
+            name, url = part.split("::", 1)
+            entries.append((name.strip(), url.strip()))
+        else:
+            entries.append(("Unknown", part))
+    return entries
+
+
+AUDIO_EXTENSIONS = {".mp3", ".m4a", ".wav", ".flac", ".ogg", ".opus"}
 
 
 def _output_path(output_dir: str, video: dict) -> str:
@@ -37,14 +51,54 @@ def _output_path(output_dir: str, video: dict) -> str:
     return os.path.join(output_dir, video["playlist"], filename)
 
 
+def _process_audio_inbox(inbox_dir: str, output_dir: str, whisper_model: str, processed_ids: set, dry_run: bool) -> tuple[int, int]:
+    if not os.path.isdir(inbox_dir):
+        return 0, 0
+
+    files = [
+        f for f in os.listdir(inbox_dir)
+        if os.path.splitext(f)[1].lower() in AUDIO_EXTENSIONS
+        and os.path.splitext(f)[0] not in processed_ids
+    ]
+
+    if not files:
+        return 0, 0
+
+    log.info("Audio inbox: %d file(s) to transcribe", len(files))
+
+    if dry_run:
+        for f in files:
+            log.info("  [DRY RUN] Would transcribe: %s", f)
+        return 0, 0
+
+    success, failed = 0, 0
+    for filename in files:
+        audio_path = os.path.join(inbox_dir, filename)
+        stem = os.path.splitext(filename)[0]
+        out_path = os.path.join(output_dir, "Local Audio", f"{stem}.txt")
+        log.info("Transcribing local file: %s", filename)
+        try:
+            transcribe(audio_path, whisper_model, out_path)
+            mark_processed(stem, stem, "Local Audio")
+            os.remove(audio_path)
+            log.info("  Saved: %s", out_path)
+            success += 1
+        except Exception as e:
+            log.error("  FAILED %s: %s", filename, e)
+            failed += 1
+
+    return success, failed
+
+
 def run(dry_run: bool = False) -> None:
     output_dir = os.getenv("OUTPUT_DIR", "transcripts")
     whisper_model = os.getenv("WHISPER_MODEL", "medium")
     cutoff_str = os.getenv("CUTOFF_DATE", "2020-01-01")
     cutoff_date = date.fromisoformat(cutoff_str)
+    inbox_dir = os.getenv("AUDIO_INBOX_DIR", os.path.join(os.path.dirname(__file__), "audio_inbox"))
 
-    playlist_urls = _parse_env_list("YOUTUBE_PLAYLISTS")
-    video_urls = _parse_env_list("YOUTUBE_VIDEOS")
+    playlist_entries = _parse_env_entries("YOUTUBE_PLAYLISTS")
+    video_entries = _parse_env_entries("YOUTUBE_VIDEOS")
 
     log.info("=== Run started (dry_run=%s) ===", dry_run)
     log.info("Cutoff date: %s | Whisper model: %s", cutoff_date, whisper_model)
@@ -52,58 +106,60 @@ def run(dry_run: bool = False) -> None:
     processed_ids = load_processed_ids()
     videos_to_process: list[dict] = []
 
-    for url in playlist_urls:
-        log.info("Fetching playlist: %s", url)
+    for name, url in playlist_entries:
+        log.info("Fetching playlist: %s", name)
         try:
-            videos = fetch_playlist_videos(url, cutoff_date, processed_ids)
+            videos = fetch_playlist_videos(url, name, cutoff_date, processed_ids)
             log.info("  Found %d new video(s)", len(videos))
             videos_to_process.extend(videos)
         except Exception as e:
-            log.error("  Failed to fetch playlist %s: %s", url, e)
+            log.error("  Failed to fetch playlist %s: %s", name, e)
 
-    for url in video_urls:
-        log.info("Fetching video: %s", url)
+    for name, url in video_entries:
+        log.info("Fetching video: %s", name)
         try:
-            video = fetch_single_video(url, processed_ids)
+            video = fetch_single_video(url, name, processed_ids)
             if video:
                 log.info("  New: %s", video["title"])
                 videos_to_process.append(video)
             else:
                 log.info("  Already processed or unavailable")
         except Exception as e:
-            log.error("  Failed to fetch video %s: %s", url, e)
-
-    if not videos_to_process:
-        log.info("No new videos to process. Done.")
-        return
-
-    log.info("Total new videos: %d", len(videos_to_process))
-
-    if dry_run:
-        log.info("--- DRY RUN: would process ---")
-        for v in videos_to_process:
-            log.info("  [%s] %s / %s", v["id"], v["playlist"], v["title"])
-        return
+            log.error("  Failed to fetch video %s: %s", name, e)
 
     success, failed = 0, 0
 
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        for video in videos_to_process:
-            log.info("Processing: %s - %s", video["playlist"], video["title"])
-            audio_path = None
-            try:
-                audio_path = download_audio(video, tmp_dir)
-                out_path = _output_path(output_dir, video)
-                transcribe(audio_path, whisper_model, out_path)
-                mark_processed(video["id"], video["title"], video["playlist"])
-                log.info("  Saved: %s", out_path)
-                success += 1
-            except Exception as e:
-                log.error("  FAILED %s: %s", video["id"], e)
-                failed += 1
-            finally:
-                if audio_path and os.path.exists(audio_path):
-                    os.remove(audio_path)
+    if videos_to_process:
+        log.info("Total new videos: %d", len(videos_to_process))
+
+        if dry_run:
+            log.info("--- DRY RUN: would process ---")
+            for v in videos_to_process:
+                log.info("  [%s] %s / %s", v["id"], v["playlist"], v["title"])
+        else:
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                for video in videos_to_process:
+                    log.info("Processing: %s - %s", video["playlist"], video["title"])
+                    audio_path = None
+                    try:
+                        audio_path = download_audio(video, tmp_dir)
+                        out_path = _output_path(output_dir, video)
+                        transcribe(audio_path, whisper_model, out_path)
+                        mark_processed(video["id"], video["title"], video["playlist"])
+                        log.info("  Saved: %s", out_path)
+                        success += 1
+                    except Exception as e:
+                        log.error("  FAILED %s: %s", video["id"], e)
+                        failed += 1
+                    finally:
+                        if audio_path and os.path.exists(audio_path):
+                            os.remove(audio_path)
+    else:
+        log.info("No new YouTube videos to process.")
+
+    inbox_success, inbox_failed = _process_audio_inbox(inbox_dir, output_dir, whisper_model, processed_ids, dry_run)
+    success += inbox_success
+    failed += inbox_failed
 
     log.info("=== Run complete: %d succeeded, %d failed ===", success, failed)
 

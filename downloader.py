@@ -8,38 +8,59 @@ def _sanitize(name: str) -> str:
     return re.sub(r'[\\/*?:"<>|]', "_", name).strip()
 
 
-def fetch_playlist_videos(playlist_url: str, cutoff_date: date, processed_ids: set) -> list[dict]:
-    """Return list of unprocessed video metadata from a playlist."""
-    ydl_opts = {
-        "quiet": True,
-        "extract_flat": True,
-        "skip_download": True,
-    }
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+def fetch_playlist_videos(playlist_url: str, playlist_name: str, cutoff_date: date, processed_ids: set) -> list[dict]:
+    """Return list of unprocessed video metadata from a playlist.
+
+    YouTube flat extraction omits upload_date, so we fetch individual metadata
+    for unprocessed candidates. Playlists are newest-first; we stop after
+    seeing 3 consecutive videos older than cutoff to avoid scanning the whole history.
+    """
+    flat_opts = {"quiet": True, "extract_flat": True, "skip_download": True}
+    with yt_dlp.YoutubeDL(flat_opts) as ydl:
         info = ydl.extract_info(playlist_url, download=False)
 
-    playlist_name = _sanitize(info.get("title", "Unknown Playlist"))
+    candidates = [
+        (e["id"], e.get("title", e["id"]))
+        for e in (info.get("entries") or [])
+        if e and e.get("id") and e["id"] not in processed_ids
+    ]
+
+    if not candidates:
+        return []
+
+    meta_opts = {"quiet": True, "skip_download": True}
     videos = []
-    for entry in info.get("entries", []):
-        video_id = entry.get("id")
-        if not video_id or video_id in processed_ids:
-            continue
-        upload_str = entry.get("upload_date")  # YYYYMMDD string or None
-        if upload_str:
-            upload_date = date(int(upload_str[:4]), int(upload_str[4:6]), int(upload_str[6:8]))
-            if upload_date < cutoff_date:
+    consecutive_old = 0
+
+    with yt_dlp.YoutubeDL(meta_opts) as ydl:
+        for video_id, raw_title in candidates:
+            try:
+                meta = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
+            except Exception:
                 continue
-        videos.append({
-            "id": video_id,
-            "title": _sanitize(entry.get("title", video_id)),
-            "upload_date": upload_str,
-            "url": f"https://www.youtube.com/watch?v={video_id}",
-            "playlist": playlist_name,
-        })
+
+            upload_str = meta.get("upload_date")
+            if upload_str:
+                upload_date = date(int(upload_str[:4]), int(upload_str[4:6]), int(upload_str[6:8]))
+                if upload_date < cutoff_date:
+                    consecutive_old += 1
+                    if consecutive_old >= 3:
+                        break
+                    continue
+                consecutive_old = 0
+
+            videos.append({
+                "id": video_id,
+                "title": _sanitize(meta.get("title", raw_title)),
+                "upload_date": upload_str,
+                "url": f"https://www.youtube.com/watch?v={video_id}",
+                "playlist": _sanitize(playlist_name),
+            })
+
     return videos
 
 
-def fetch_single_video(url: str, processed_ids: set) -> dict | None:
+def fetch_single_video(url: str, label: str, processed_ids: set) -> dict | None:
     """Return metadata for a single video if not already processed."""
     ydl_opts = {"quiet": True, "skip_download": True}
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -53,7 +74,7 @@ def fetch_single_video(url: str, processed_ids: set) -> dict | None:
         "title": _sanitize(info.get("title", video_id)),
         "upload_date": info.get("upload_date"),
         "url": url,
-        "playlist": "Individual Videos",
+        "playlist": _sanitize(label),
     }
 
 
