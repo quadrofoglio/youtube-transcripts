@@ -1,4 +1,5 @@
 import argparse
+import ctypes
 import logging
 import os
 import sys
@@ -109,7 +110,13 @@ def _process_audio_inbox(inbox_dir: str, output_dir: str, whisper_model: str, pr
     return success, failed
 
 
+ES_CONTINUOUS = 0x80000000
+ES_SYSTEM_REQUIRED = 0x00000001
+ES_AWAYMODE_REQUIRED = 0x00000040
+
+
 def run(dry_run: bool = False) -> None:
+    ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_AWAYMODE_REQUIRED)
     output_dir = os.getenv("OUTPUT_DIR", "transcripts")
     whisper_model = os.getenv("WHISPER_MODEL", "medium")
     cutoff_str = os.getenv("CUTOFF_DATE", "2020-01-01")
@@ -180,6 +187,7 @@ def run(dry_run: bool = False) -> None:
     success += inbox_success
     failed += inbox_failed
 
+    ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS)
     log.info("=== Run complete: %d succeeded, %d failed ===", success, failed)
 
 
